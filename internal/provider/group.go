@@ -922,10 +922,14 @@ func buildGroupEntries(entries []Entry) []Entry {
 			var efforts []string
 			images, thinks, ctx, output := false, false, 0, 0
 			var imageInput *bool
+			// the kinds of input and output a member's source listed
+			// (audio, video and pdf beside image, #1595)
+			var inputs, outputs []string
 			unknown, reasonless := false, false
 			if j := find(m.Provider.ID, m.Model); j >= 0 {
 				x := &entries[j]
 				efforts, images, thinks, ctx, output, imageInput = x.Efforts, x.Images, x.Reasoning, x.Context, x.Output, x.ImageInput
+				inputs, outputs = x.Inputs, x.Outputs
 				unknown, reasonless = levelsUnknown(*x), x.Reasonless
 			}
 			// it reasons when a member does: the gateway sends the
@@ -951,6 +955,13 @@ func buildGroupEntries(entries []Entry) []Entry {
 			// group of DeepSeek V4.1 Flash with a text-only member in it
 			// turned every image away, though its other members see)
 			e.Images = e.Images || images
+			// and it takes every other kind a member does, a video or an
+			// audio clip among them: Modalities reads the group's kinds
+			// beside Images, and falls back to text and image when none
+			// is set, which left a group of a model that takes video
+			// told it doesn't
+			e.Inputs = unionKinds(e.Inputs, inputs)
+			e.Outputs = unionKinds(e.Outputs, outputs)
 			// the window agents are told is the largest a member has:
 			// a conversation too long for one member goes on to a member
 			// with room for it (#700, withRoom in the gateway), so the
@@ -1044,6 +1055,24 @@ func buildGroupEntries(entries []Entry) []Entry {
 		}
 		e.Family = g.Family
 		out = append(out, e)
+	}
+	return out
+}
+
+// unionKinds is what a group takes from two of its members' sources said:
+// every kind either of them listed, in the order given (OpenCode's: text,
+// image, audio, video, pdf). nil when neither said, which is not the same
+// as an empty list: Modalities falls back to text and image on nil, and to
+// nothing on a list (models.go).
+func unionKinds(a, b []string) []string {
+	if a == nil && b == nil {
+		return nil
+	}
+	out := append([]string{}, a...)
+	for _, k := range b {
+		if !slices.Contains(out, k) {
+			out = append(out, k)
+		}
 	}
 	return out
 }

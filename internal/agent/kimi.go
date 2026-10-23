@@ -5,14 +5,14 @@ package agent
 // Python kimi-cli's in ~/.kimi ($KIMI_SHARE_DIR), in the same shape (see
 // KimiDir): the model sessions start with as default_model, a key
 // of its [models."<key>"] tables, each naming a [providers.<name>] table and
-// the model to ask it for. magpie adds itself as the provider "magpie" (the
-// gateway, spoken to as Kimi's own chat completions, so the thinking goes
-// both ways as reasoning_content) and one model table per catalog model,
-// keyed "magpie/<provider>/<model>", so the catalog joins Kimi's /model
-// picker. The default the user had is stashed and put back when magpie steps
-// out. Kimi refuses a config whose default_model or a model's provider is
-// missing, so the provider goes in before the models and the default after,
-// and out the other way round.
+// the model to ask it for. Magpie adds itself as "magpie" for Chat,
+// "magpie-responses" for models best served as OpenAI Responses, and
+// "magpie-anthropic" for models best served as Anthropic Messages, and one
+// model table per catalog model, keyed "magpie/<provider>/<model>", so the
+// catalog joins Kimi's /model picker. The default the user had is stashed and
+// put back when magpie steps out. Kimi refuses a config whose default_model
+// or a model's provider is missing, so the providers go in before the models
+// and the default after, and out the other way round.
 
 import (
 	"encoding/json"
@@ -21,11 +21,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // kimiModelTable is the header prefix of every model table magpie writes.
 var kimiModelTable = `models."` + magpieID + "/"
+
+const kimiAnthropicID = magpieID + "-anthropic"
+const kimiResponsesID = magpieID + "-responses"
 
 // kimiContext is what Kimi is told of a model whose context magpie doesn't
 // know: it has to be told one, and compacts as it nears it.
@@ -66,6 +71,7 @@ func kimiModelTables(path string, legacy bool, wrote map[string]map[string]strin
 	var out []edit.Table
 	now := map[string]map[string]string{}
 	names, _ := edit.TOMLTables(path)
+	find := provider.GroupFinder()
 	for _, m := range magpieModels("kimi") {
 		name := "models." + strconv.Quote(magpieID+"/"+m.ID)
 		ctx := m.Context
@@ -77,7 +83,7 @@ func kimiModelTables(path string, legacy bool, wrote map[string]map[string]strin
 			was, _ = edit.GetTOMLTable(path, name)
 		}
 		kvs := []edit.KV{
-			{Path: "provider", Value: magpieID},
+			{Path: "provider", Value: kimiProviderOf(m, legacy, find)},
 			{Path: "model", Value: m.ID},
 			{Path: "max_context_size", Value: ctx},
 		}
@@ -106,6 +112,9 @@ func kimiModelTables(path string, legacy bool, wrote map[string]map[string]strin
 		if len(caps) > 0 {
 			kvs = append(kvs, edit.KV{Path: "capabilities", Value: edit.Raw("[" + strings.Join(caps, ", ") + "]")})
 		}
+		if kimiProviderOf(m, legacy, find) == kimiAnthropicID {
+			kvs = append(kvs, edit.KV{Path: "adaptive_thinking", Value: edit.Raw("true")})
+		}
 		if !legacy {
 			// the new Kimi Code's cap on a reply (max_completion_tokens),
 			// where magpie knows the model's; kimi-cli has no such key
@@ -128,6 +137,48 @@ func kimiModelTables(path string, legacy bool, wrote map[string]map[string]strin
 		out = append(out, edit.Table{Name: name, KVs: kvs})
 	}
 	return out, now
+}
+
+// kimiProviderOf keeps magpie's routing and catalog while using the native
+// wire for each model in the new Kimi Code. Kimi sets the wire for a provider
+// as a whole, so the three APIs get three providers beside the Chat one. A
+// group goes on one of them only when every member is native there; a mixed
+// group keeps Chat so no member is asked through a wire another member cannot
+// serve. kimi-cli knows only the Chat provider.
+func kimiProviderOf(m catalog.Model, legacy bool, find func(string) (provider.Group, []provider.Member, bool)) string {
+	if legacy {
+		return magpieID
+	}
+	if len(m.APIs) > 0 {
+		return kimiProviderFor(provider.Protocol(m.APIs[0]))
+	}
+	if _, ok := provider.GroupIDOf(m.ID); !ok {
+		return magpieID
+	}
+	_, members, ok := find(m.ID)
+	if !ok || len(members) == 0 {
+		return magpieID
+	}
+	api := members[0].Provider.Native(members[0].Model)
+	if api != provider.Responses && api != provider.Anthropic {
+		return magpieID
+	}
+	for _, member := range members[1:] {
+		if member.Provider.Native(member.Model) != api {
+			return magpieID
+		}
+	}
+	return kimiProviderFor(api)
+}
+
+func kimiProviderFor(api provider.Protocol) string {
+	switch api {
+	case provider.Responses:
+		return kimiResponsesID
+	case provider.Anthropic:
+		return kimiAnthropicID
+	}
+	return magpieID
 }
 
 // kimiOwn is the value of key in one of magpie's model tables: one the user
@@ -222,6 +273,8 @@ func kimiIn(at place) *Agent {
 	key := "kimi:" + path + ":default_model"
 	get := func() string { v, _ := edit.GetTOMLTop(path, "default_model"); return v }
 	providerTable := "providers." + magpieID
+	responsesProviderTable := "providers." + kimiResponsesID
+	anthropicProviderTable := "providers." + kimiAnthropicID
 	writeMagpie := func() error {
 		if err := kimiProvider(path, providerTable,
 			edit.KV{Path: "type", Value: "kimi"},
@@ -229,6 +282,22 @@ func kimiIn(at place) *Agent {
 			edit.KV{Path: "api_key", Value: at.gwKey()},
 		); err != nil {
 			return err
+		}
+		if !legacy {
+			if err := kimiProvider(path, responsesProviderTable,
+				edit.KV{Path: "type", Value: "openai_responses"},
+				edit.KV{Path: "base_url", Value: at.v1()},
+				edit.KV{Path: "api_key", Value: at.gwKey()},
+			); err != nil {
+				return err
+			}
+			if err := kimiProvider(path, anthropicProviderTable,
+				edit.KV{Path: "type", Value: "anthropic"},
+				edit.KV{Path: "base_url", Value: at.gw()},
+				edit.KV{Path: "api_key", Value: at.gwKey()},
+			); err != nil {
+				return err
+			}
 		}
 		tables, wrote := kimiModelTables(path, legacy, kimiWrote(path))
 		if err := edit.SetTOMLTables(path, []string{kimiModelTable}, tables); err != nil {
@@ -243,7 +312,13 @@ func kimiIn(at place) *Agent {
 			return err
 		}
 		forget(kimiWroteKey(path))
-		return edit.DelTOMLTable(path, providerTable)
+		if err := edit.DelTOMLTable(path, providerTable); err != nil {
+			return err
+		}
+		if err := edit.DelTOMLTable(path, responsesProviderTable); err != nil {
+			return err
+		}
+		return edit.DelTOMLTable(path, anthropicProviderTable)
 	}
 	// setDefault sets default_model, or takes it out for ""
 	setDefault := func(v string) error {
@@ -286,15 +361,28 @@ func kimiIn(at place) *Agent {
 			if m == nil {
 				return "Kimi Code's [models." + strconv.Quote(v) + "] (config.toml) is gone, so it no longer reaches magpie"
 			}
-			t, err := edit.GetTOMLTable(path, providerTable)
-			if err != nil {
-				return err.Error()
+			tables := []string{providerTable}
+			if !legacy {
+				tables = append(tables, responsesProviderTable, anthropicProviderTable)
 			}
-			if t == nil {
-				return "Kimi Code's [" + providerTable + "] (config.toml) is gone, so it no longer reaches magpie"
+			for _, table := range tables {
+				t, err := edit.GetTOMLTable(path, table)
+				if err != nil {
+					return err.Error()
+				}
+				if t == nil {
+					return "Kimi Code's [" + table + "] (config.toml) is gone, so it no longer reaches magpie"
+				}
+				baseURL := at.v1()
+				if table == anthropicProviderTable {
+					baseURL = at.gw()
+				}
+				if off := wiringOff("Kimi Code ["+table+"]", path, func(k string) (string, bool) { v, ok := t[k]; return v, ok },
+					"base_url", baseURL, "api_key", at.gwKey()); off != "" {
+					return off
+				}
 			}
-			return wiringOff("Kimi Code", path, func(k string) (string, bool) { v, ok := t[k]; return v, ok },
-				"base_url", at.v1(), "api_key", at.gwKey())
+			return ""
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",
